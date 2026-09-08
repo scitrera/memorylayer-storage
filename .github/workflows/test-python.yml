@@ -44,8 +44,10 @@ jobs:
 
       - name: Select Go for real gateway tests
         run: |
-          echo /usr/local/go/bin >> "$GITHUB_PATH"
-          /usr/local/go/bin/go version
+          version="$(awk '$1 == "go" { print $2; exit }' ../../go.work)"
+          go_root="$(GOTOOLCHAIN="go$version" go env GOROOT)"
+          echo "$go_root/bin" >> "$GITHUB_PATH"
+          "$go_root/bin/go" version
         working-directory: clients/python
 
       - name: Install

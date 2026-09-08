@@ -44,6 +44,8 @@ protocol code did not change.
    `blobgw/v0.7.1`, `blobgw-edge/v0.7.1`, `blobgw-s3/v0.7.1`,
    `mlfs/v0.7.1`, `mlfs-csi/v0.7.1`, and `clients/python/v0.7.1`.
 4. Push the branch and explicit component tags after the release is approved.
+   Push each tag separately: GitHub does not emit tag-push workflow events when
+   more than three tags are pushed together.
    Go module tags are immediately visible to consumers; CI runs after the push.
    The generated workflows check tag/version agreement, test the stack, and
    publish the selected Go component's artifacts. The Python client tag provides
