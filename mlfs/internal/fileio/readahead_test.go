@@ -4,7 +4,9 @@
 package fileio_test
 
 import (
+	"bytes"
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,11 +23,17 @@ import (
 // counts backing Reads so a test can see prefetch fetching ahead of demand.
 type slowStore struct {
 	chunkstore.Store
-	delay time.Duration
-	reads atomic.Int64
+	delay      time.Duration
+	reads      atomic.Int64
+	beforeRead func(context.Context, uint64) error
 }
 
 func (s *slowStore) Read(ctx context.Context, id uint64) ([]byte, error) {
+	if s.beforeRead != nil {
+		if err := s.beforeRead(ctx, id); err != nil {
+			return nil, err
+		}
+	}
 	if s.delay > 0 {
 		time.Sleep(s.delay)
 	}
@@ -152,42 +160,78 @@ func TestReadaheadWarmsWindowAhead(t *testing.T) {
 	}
 }
 
-// TestReadaheadHidesBackingLatency proves the point of the feature: a sequential
-// read over a high-latency backing completes materially faster with readahead on,
-// because upcoming slices are fetched concurrently ahead of demand instead of one
-// blocking GET at a time.
-func TestReadaheadHidesBackingLatency(t *testing.T) {
+// TestReadaheadFetchesConcurrently verifies that backing reads overlap ahead of
+// demand, then serve correct bytes from the warmed cache. A gate holds the
+// backing requests open, so this does not depend on a wall-clock speedup ratio
+// that varies with CPU, disk, and database contention on shared CI runners.
+func TestReadaheadFetchesConcurrently(t *testing.T) {
 	const mib = 1 << 20
-	const delay = 20 * time.Millisecond
 	regions := make([][]byte, 8)
 	for i := range regions {
 		regions[i] = randomBytes(t, mib)
 	}
 
-	seqRead := func(window int64) time.Duration {
-		s, ino := newReadaheadStack(t, delay, window, regions)
-		ctx := context.Background()
-		buf := make([]byte, mib)
-		start := time.Now()
-		for i := int64(0); i < int64(len(regions)); i++ {
-			if _, err := s.f.Read(ctx, ino, i*mib, buf); err != nil {
-				t.Fatalf("read @%d MiB: %v", i, err)
-			}
+	s, ino := newReadaheadStack(t, 0, 8*mib, regions)
+	ids := s.sliceIDByPos(t, ino)
+	blocked := make(map[uint64]bool)
+	for i := int64(2); i < int64(len(regions)); i++ {
+		blocked[ids[i*mib]] = true
+	}
+	started := make(chan uint64, len(regions))
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release) // release blocked reads before the stack's Close cleanup
+	s.slow.beforeRead = func(ctx context.Context, id uint64) error {
+		if !blocked[id] {
+			return nil
 		}
-		return time.Since(start)
+		select {
+		case started <- id:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-gate:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	off := seqRead(0)      // readahead disabled: ~8 serial GETs
-	on := seqRead(8 * mib) // readahead on: GETs overlap ahead of demand
-
-	t.Logf("sequential read of %d MiB @ %v/slice: readahead off=%v on=%v", len(regions), delay, off, on)
-	// Off pays ~8×delay serially (~160 ms). On overlaps the GETs, so it should be
-	// well under that. A loose bound keeps the assertion robust under CI load.
-	if on >= off {
-		t.Fatalf("readahead did not speed up the cold sequential read: off=%v on=%v", off, on)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	buf := make([]byte, mib)
+	read := func(i int) {
+		t.Helper()
+		n, err := s.f.Read(ctx, ino, int64(i)*mib, buf)
+		if err != nil || n != mib || !bytes.Equal(buf, regions[i]) {
+			t.Fatalf("read @%d MiB: n=%d err=%v or incorrect content", i, n, err)
+		}
 	}
-	if on > off*3/4 {
-		t.Fatalf("readahead speedup too small to be the prefetch effect: off=%v on=%v", off, on)
+	read(0)
+	read(1) // sequential prefix triggers prefetch; no later slice is demand-read
+
+	seen := make(map[uint64]bool)
+	for len(seen) < 2 {
+		select {
+		case id := <-started:
+			seen[id] = true
+		case <-ctx.Done():
+			t.Fatal("prefetch did not start two distinct backing reads concurrently")
+		}
+	}
+	release()
+	for id := range blocked {
+		if !waitCached(s.dc, id, 10*time.Second) {
+			t.Fatalf("prefetched slice %d did not reach the cache", id)
+		}
+	}
+	backingReads := s.slow.reads.Load()
+	for i := 2; i < len(regions); i++ {
+		read(i)
+	}
+	if got := s.slow.reads.Load(); got != backingReads {
+		t.Fatalf("demand reads fetched backing data after prefetch: before=%d after=%d", backingReads, got)
 	}
 }
 
