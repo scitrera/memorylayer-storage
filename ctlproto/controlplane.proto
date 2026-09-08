@@ -1,0 +1,140 @@
+// Copyright 2026 Scitrera LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// controlplane.proto — canonical schema for the blobgw ↔ mlfs-node
+// control-plane RPC contract (ADR-001 §2.5).
+//
+// STATUS: source-of-truth for the protobuf target. Go types are currently
+// hand-written structs in ctlproto.go with a JSONCodec default because
+// protoc-gen-go is not yet in the build toolchain. When protoc-gen-go is
+// available:
+//
+//   1. Run: protoc --go_out=. --go_opt=paths=source_relative controlplane.proto
+//   2. Replace the hand-written struct definitions in ctlproto.go with the
+//      generated types.
+//   3. Replace JSONCodec with a ProtobufCodec wrapping proto.Marshal /
+//      proto.Unmarshal. The Codec interface is the only seam that changes.
+//
+// Field names here intentionally match the JSON tags in ctlproto.go to make
+// the migration mechanical.
+
+syntax = "proto3";
+
+package ctlproto;
+
+option go_package = "github.com/scitrera/memorylayer-storage/ctlproto";
+
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+// PackRef locates a content-addressed chunk within a pack blob.
+message PackRef {
+  string pack_hash = 1;
+  int64  offset    = 2;
+  int64  size      = 3;
+}
+
+// ChunkLocation pairs a chunk's content hash with its PackRef.
+message ChunkLocation {
+  string  chunk_hash = 1;
+  PackRef pack_ref   = 2;
+}
+
+// ---------------------------------------------------------------------------
+// LookupBatch — resolve chunk hashes to pack locations
+// ---------------------------------------------------------------------------
+
+message LookupBatchRequest {
+  string          domain       = 1;
+  repeated string chunk_hashes = 2;
+}
+
+message LookupBatchResponse {
+  // Locations maps chunk_hash → PackRef for hashes that were found.
+  // Hashes absent from this map are novel (not yet indexed).
+  map<string, PackRef> locations = 1;
+  string               error     = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Record — persist chunk locations after successful S3 upload
+// ---------------------------------------------------------------------------
+
+message RecordRequest {
+  string                  domain    = 1;
+  repeated ChunkLocation  locations = 2;
+}
+
+message RecordResponse {
+  string error = 1;
+}
+
+// ---------------------------------------------------------------------------
+// PresignBatch — mint short-lived presigned S3 URLs
+// ---------------------------------------------------------------------------
+
+// PresignOp selects GET (read) or PUT (write) for a presigned URL.
+//
+// Codec migration note: the current Go implementation uses JSONCodec and
+// encodes PresignOp as its string name ("GET" or "PUT"). The protobuf binary
+// codec encodes enum values as integers (GET=1, PUT=2), which changes the wire
+// representation. Switching from JSONCodec to ProtobufCodec therefore requires
+// a coordinated rolling upgrade where all nodes adopt the new codec at the same
+// time. Alternatively, keep the wire stable by mapping the enum to its string
+// name (e.g. via protojson.MarshalOptions{UseEnumNumbers: false}). Do not
+// perform a gradual rollout across mixed-codec clusters without an explicit
+// compatibility shim.
+enum PresignOp {
+  PRESIGN_OP_UNSPECIFIED = 0;
+  GET                    = 1;
+  PUT                    = 2;
+}
+
+message PresignBatchRequest {
+  string    domain      = 1;
+  PresignOp op          = 2;
+  repeated string keys  = 3;
+  int32  ttl_seconds    = 4;
+}
+
+message PresignBatchResponse {
+  // URLs maps object key → presigned URL.
+  map<string, string> urls            = 1;
+  int64               expires_at_unix = 2;
+  string              error           = 3;
+}
+
+// ---------------------------------------------------------------------------
+// PurgePacks — remove GC'd pack entries from the index
+// ---------------------------------------------------------------------------
+
+message PurgePacksRequest {
+  string          domain      = 1;
+  repeated string pack_hashes = 2;
+}
+
+message PurgePacksResponse {
+  string error = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Service definition (informational — NATS req-reply is used, not gRPC)
+// ---------------------------------------------------------------------------
+//
+// NATS subjects (see subjects.go):
+//   blobgw.<tenant>.index.lookup  → LookupBatchRequest / LookupBatchResponse
+//   blobgw.<tenant>.index.record  → RecordRequest / RecordResponse
+//   blobgw.<tenant>.presign       → PresignBatchRequest / PresignBatchResponse
+//   blobgw.<tenant>.gc.purge      → PurgePacksRequest / PurgePacksResponse
+//
+// All blobgw replicas subscribe as queue group "blobgw" for load-balanced
+// scale-out (ADR-001 §2.5). No gRPC server is defined here; the service block
+// below is for documentation and future tooling only.
+
+service ControlPlane {
+  rpc LookupBatch (LookupBatchRequest)   returns (LookupBatchResponse);
+  rpc Record      (RecordRequest)        returns (RecordResponse);
+  rpc PresignBatch(PresignBatchRequest)  returns (PresignBatchResponse);
+  rpc PurgePacks  (PurgePacksRequest)    returns (PurgePacksResponse);
+}

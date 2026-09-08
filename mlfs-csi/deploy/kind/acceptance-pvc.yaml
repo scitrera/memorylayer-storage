@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlfs-test
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: mlfs
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mlfs-writer
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo mlfs-csi-ok > /data/proof && sync && sleep 3600"]
+      volumeMounts:
+        - { name: v, mountPath: /data }
+  volumes:
+    - name: v
+      persistentVolumeClaim:
+        claimName: mlfs-test

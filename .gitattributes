@@ -1,0 +1,2 @@
+# Preserve upstream license/notice text byte for byte, including whitespace.
+LICENSES/third-party/** -whitespace

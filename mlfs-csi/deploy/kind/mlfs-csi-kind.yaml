@@ -1,0 +1,108 @@
+# mlfs CSI driver — kind acceptance deployment (single node).
+#
+# This validates the CSI DRIVER end to end (dynamic provision → bind-mount →
+# pod write → delete). The shared "mlfs root" is a hostPath directory rather than
+# a real mlfs FUSE mount: the CSI driver's job (subdir + bind-mount) is identical
+# regardless of what the root is, and the mlfs FUSE mount is validated separately
+# by the mlfs test suite. In production the root is the node's mlfs mount (see
+# deploy/mlfs-csi.yaml). Single node ⇒ controller + node pods share one hostPath.
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: mlfs.csi.scitrera.com
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  fsGroupPolicy: File
+  volumeLifecycleModes: [Persistent]
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mlfs
+provisioner: mlfs.csi.scitrera.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: mlfs-csi, namespace: kube-system }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: mlfs-csi-provisioner }
+rules:
+  - { apiGroups: [""], resources: ["persistentvolumes"], verbs: ["get","list","watch","create","delete","update","patch"] }
+  - { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get","list","watch","update"] }
+  - { apiGroups: ["storage.k8s.io"], resources: ["storageclasses"], verbs: ["get","list","watch"] }
+  - { apiGroups: ["storage.k8s.io"], resources: ["csinodes"], verbs: ["get","list","watch"] }
+  - { apiGroups: [""], resources: ["nodes"], verbs: ["get","list","watch"] }
+  - { apiGroups: [""], resources: ["events"], verbs: ["list","watch","create","update","patch"] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: mlfs-csi-provisioner }
+subjects: [{ kind: ServiceAccount, name: mlfs-csi, namespace: kube-system }]
+roleRef: { kind: ClusterRole, name: mlfs-csi-provisioner, apiGroup: rbac.authorization.k8s.io }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: mlfs-csi-controller, namespace: kube-system }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mlfs-csi-controller } }
+  template:
+    metadata: { labels: { app: mlfs-csi-controller } }
+    spec:
+      serviceAccountName: mlfs-csi
+      containers:
+        - name: csi
+          image: mlfs-csi:dev
+          imagePullPolicy: IfNotPresent
+          args: ["-endpoint=unix:///csi/csi.sock", "-node-id=controller", "-mlfs-root=/mnt/root"]
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+            - { name: root, mountPath: /mnt/root }
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args: ["--csi-address=/csi/csi.sock", "--leader-election=false", "-v=2"]
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+      volumes:
+        - { name: socket-dir, emptyDir: {} }
+        - { name: root, hostPath: { path: /var/lib/mlfs-csi-root, type: DirectoryOrCreate } }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: mlfs-csi-node, namespace: kube-system }
+spec:
+  selector: { matchLabels: { app: mlfs-csi-node } }
+  template:
+    metadata: { labels: { app: mlfs-csi-node } }
+    spec:
+      serviceAccountName: mlfs-csi
+      containers:
+        - name: csi
+          image: mlfs-csi:dev
+          imagePullPolicy: IfNotPresent
+          securityContext: { privileged: true }
+          args: ["-endpoint=unix:///csi/csi.sock", "-mlfs-root=/mnt/root"]
+          env:
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+            - { name: root, mountPath: /mnt/root, mountPropagation: Bidirectional }
+            - { name: kubelet-pods, mountPath: /var/lib/kubelet/pods, mountPropagation: Bidirectional }
+        - name: registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args: ["--csi-address=/csi/csi.sock", "--kubelet-registration-path=/var/lib/kubelet/plugins/mlfs.csi.scitrera.com/csi.sock"]
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+            - { name: registration-dir, mountPath: /registration }
+      volumes:
+        - { name: socket-dir, hostPath: { path: /var/lib/kubelet/plugins/mlfs.csi.scitrera.com, type: DirectoryOrCreate } }
+        - { name: registration-dir, hostPath: { path: /var/lib/kubelet/plugins_registry, type: Directory } }
+        - { name: kubelet-pods, hostPath: { path: /var/lib/kubelet/pods, type: Directory } }
+        - { name: root, hostPath: { path: /var/lib/mlfs-csi-root, type: DirectoryOrCreate } }

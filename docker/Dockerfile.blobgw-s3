@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Build context: repository root (all workspace modules are needed).
+FROM --platform=$BUILDPLATFORM golang:1.26.8 AS build
+ARG TARGETOS
+ARG TARGETARCH
+ENV CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build cd /src/blobgw-s3 && go build -trimpath -ldflags="-s -w" -o /out/blobgw-s3 ./cmd/blobgw-s3
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG VERSION
+LABEL org.opencontainers.image.source="https://github.com/scitrera/memorylayer-storage" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="$VERSION"
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/memorylayer-storage/
+COPY LICENSES /usr/share/doc/memorylayer-storage/LICENSES
+COPY --from=build /out/blobgw-s3 /usr/local/bin/blobgw-s3
+ENTRYPOINT ["/usr/local/bin/blobgw-s3"]

@@ -1,0 +1,248 @@
+# mlfs CSI driver — multi-tenant install manifest (L2.11+).
+#
+# Model: ONE node plugin per node serves PVCs for MANY mlfs domains
+# concurrently (see docs/MLFS_SANDBOX_MULTITENANCY_GAP.md). In -launch-mode=pod
+# the node plugin creates one mlfs "mount pod" PER DOMAIN on its node (a peer pod
+# it manages via the API, NOT a child of the csi container — so a csi restart/
+# upgrade does not cgroup-kill the daemons; the §7.3 fix). Each mount pod mounts
+# FUSE under -domains-base (a Bidirectional hostPath, so mounts propagate to the
+# host and into consumer pods and survive a plugin restart). The plugin ref-
+# counts mount pods by PVC, re-adopts live ones on startup, and bind-mounts each
+# PVC's subdir into its pod. A PVC selects its domain + per-tenant creds per-PVC
+# via StorageClass parameters + CSI node-publish secrets — no per-tenant node
+# pinning and no per-tenant StorageClass/CSIDriver duplication.
+#
+# Before applying: build + push the image (it bundles BOTH mlfs-csi and the
+# mlfs daemon — see Dockerfile) and set it below (csi image AND -mount-pod-image).
+# Per tenant, the platform mints a Secret `mlfs-domain-creds` in the tenant's
+# namespace (keys: domain, nats-creds, meta-dsn); blobgw resolves that tenant's
+# S3 bucket out-of-band.
+#
+# HARD REQUIREMENT — NATS must run in operator/JWT mode with a System Account:
+# mlfs authenticates with decentralized JWT creds (nats.UserCredentials) and the
+# driver requires a non-empty per-tenant `nats-creds`. A no-auth or user/password
+# NATS server will NOT work (you will hit "system account not setup"). Configure
+# the shared R3 cluster as operator/JWT (this also governs blobgw's -nats-creds).
+# Verified specifics (platform k8s acceptance):
+#   - the SYS/system account must NOT be granted JetStream (the server fatals
+#     "Not allowed to enable JetStream on the system account"); and
+#   - each TENANT account MUST have JetStream (KV + FileStorage) — mlfs
+#     coordination uses JetStream KV.
+#
+# Legacy single-shared-mount mode (one domain per node, e.g. the public HF
+# model-cache, §8) is still supported: drop -domains-base, set -mlfs-root to a
+# co-located mlfs mount, and omit the StorageClass parameters/secrets.
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: mlfs.csi.scitrera.com
+spec:
+  attachRequired: false        # no external attach; publish is a node-local bind mount
+  podInfoOnMount: false
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
+---
+# One StorageClass serves all tenants. The domain + per-tenant creds arrive per
+# PVC through the node-publish secret, templated to the consuming PVC's
+# namespace (tenant == namespace). natsUrl is the shared R3 cluster (account-
+# per-domain isolation); it can also be supplied cluster-wide via the node
+# plugin's -default-nats-url and omitted here.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mlfs
+provisioner: mlfs.csi.scitrera.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false
+parameters:
+  natsUrl: "nats://nats.mlfs-control.svc:4222"
+  # Stamp the per-PVC subdir 0777 so NON-root pods can write to it (the node
+  # creates the subdir root-owned 0755; mlfs isolation is domain-scoped and its
+  # domain root is likewise seeded 0o777). Honored by NodePublishVolume.
+  dirMode: "0777"
+  # Per-PVC node-publish secret (sensitive: domain, nats-creds, meta-dsn),
+  # resolved in the consuming PVC's namespace so each tenant supplies its own.
+  csi.storage.k8s.io/node-publish-secret-name: "mlfs-domain-creds"
+  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
+---
+# Example per-tenant secret (one per tenant namespace; platform-minted — shown
+# here for reference, not applied by this manifest):
+#
+#   apiVersion: v1
+#   kind: Secret
+#   metadata: { name: mlfs-domain-creds, namespace: <tenant-ns> }
+#   stringData:
+#     domain:     <tenant-slug>          # mlfs dedup domain / NATS account token
+#     nats-creds: |                       # this tenant's NATS account credentials
+#       -----BEGIN NATS USER JWT----- ...
+#     meta-dsn:   postgres://.../<tenant> # this tenant's mlfs meta database
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mlfs-csi
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mlfs-csi-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # The external-provisioner reads node-publish secrets to stamp them onto PVs.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # The node plugin manages per-domain mlfs "mount pods" (-launch-mode=pod).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mlfs-csi-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: mlfs-csi
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: mlfs-csi-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+# Controller: dynamic provisioning only (CreateVolume/DeleteVolume). In the
+# multi-domain model CreateVolume is metadata-only — the per-domain subdir is
+# created lazily node-side at publish — so the controller needs NO mlfs mount,
+# only a small scratch dir for capacity bookkeeping.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlfs-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mlfs-csi-controller }
+  template:
+    metadata:
+      labels: { app: mlfs-csi-controller }
+    spec:
+      serviceAccountName: mlfs-csi
+      containers:
+        - name: csi
+          image: ghcr.io/scitrera/mlfs-csi:0.7.1  # set me
+          args:
+            - "-endpoint=unix:///csi/csi.sock"
+            - "-node-id=controller"
+            - "-mlfs-root=/var/lib/mlfs/meta"   # controller-local capacity meta only
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+            - { name: meta-dir, mountPath: /var/lib/mlfs/meta }
+        - name: external-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--leader-election=false"
+            - "--extra-create-metadata"   # passes pvc namespace/name for secret templating
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+      volumes:
+        - { name: socket-dir, emptyDir: {} }
+        - { name: meta-dir, emptyDir: {} }
+---
+# Node plugin: one per node. In -launch-mode=pod it creates one per-domain mlfs
+# "mount pod" (a peer pod it manages via the API), waits for the mount, and
+# bind-mounts PVC subdirs into consumer pods. The mount pods (NOT the csi
+# container) run mlfs + own /dev/fuse, so a csi-container restart/upgrade does
+# NOT cgroup-kill the daemons; on startup the plugin re-adopts the live mount
+# pods. No hostPID needed (mount pods are independent peers). The mount-pod
+# image bundles the mlfs daemon (the same image works — see Dockerfile).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mlfs-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: { app: mlfs-csi-node }
+  template:
+    metadata:
+      labels: { app: mlfs-csi-node }
+    spec:
+      serviceAccountName: mlfs-csi
+      containers:
+        - name: csi
+          image: ghcr.io/scitrera/mlfs-csi:0.7.1  # set me
+          securityContext:
+            privileged: true       # bind mounts need CAP_SYS_ADMIN
+          args:
+            - "-endpoint=unix:///csi/csi.sock"
+            - "-domains-base=/var/lib/mlfs/domains"
+            - "-launch-mode=pod"
+            - "-mount-pod-namespace=kube-system"
+            - "-mount-pod-image=ghcr.io/scitrera/mlfs-csi:0.7.1"  # set me (bundles mlfs)
+            # Per-domain mlfs cache + write-back tuning (optional):
+            #   -cache-min-free-fraction=0.15   # keep ≥15% of the cache disk free (LRU self-sizes per node)
+            #   -cache-max-bytes=53687091200    # hard 50 GiB cap (composes with the fraction)
+            #   -cache-base=/mnt/nvme/mlfs       # put the cache (incl. write-back staging) on a fast disk;
+            #                                    # mount that hostPath here AND it is auto-added to mount pods.
+            #                                    # WARNING: on ephemeral storage, un-drained writes are lost
+            #                                    # on node termination — use for read-mostly caches.
+            #   -upload-concurrency=8           # parallel pack uploads; default 0 = auto = min(NumCPU,16).
+            #                                    # 1 = serial; set N to override. Lifts -remote write throughput.
+            #   -pack-target-bytes=16777216     # casstore pack size (0 = mlfs default ~16 MiB)
+          env:
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            # Optional cluster-wide default; a StorageClass natsUrl param overrides it.
+            # NOTE: the mount pod resolves this + the per-tenant meta-dsn from ITS
+            # network. If the mount pod is not hostNetwork, *.svc names resolve via
+            # CoreDNS; if it is, they must be host-resolvable. Keep these resolvable
+            # from the mount pod's network.
+            - name: MLFS_NATS_URL
+              value: "nats://nats.mlfs-control.svc:4222"
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+            # Per-domain mlfs mounts live here; Bidirectional so the mount pods'
+            # FUSE mounts propagate to the host (and thus into consumer pods) and
+            # survive a csi-plugin restart.
+            - { name: domains-dir, mountPath: /var/lib/mlfs/domains, mountPropagation: Bidirectional }
+            - { name: kubelet-pods, mountPath: /var/lib/kubelet/pods, mountPropagation: Bidirectional }
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/mlfs.csi.scitrera.com/csi.sock"
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+            - { name: registration-dir, mountPath: /registration }
+      volumes:
+        - name: socket-dir
+          hostPath: { path: /var/lib/kubelet/plugins/mlfs.csi.scitrera.com, type: DirectoryOrCreate }
+        - name: registration-dir
+          hostPath: { path: /var/lib/kubelet/plugins_registry, type: Directory }
+        - name: kubelet-pods
+          hostPath: { path: /var/lib/kubelet/pods, type: Directory }
+        - name: domains-dir
+          hostPath: { path: /var/lib/mlfs/domains, type: DirectoryOrCreate }

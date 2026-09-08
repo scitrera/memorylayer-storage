@@ -1,0 +1,17 @@
+# 4K random write, queue depth 32, fsync every write — the durability-stress
+# job. Acceptance target (docs/operations.md): >= 20K IOPS on local NVMe.
+# Run via test/fio/run-fio.sh (which sets DIRECTORY to a live mlfs mount).
+[global]
+ioengine=libaio
+direct=0
+fsync=1
+rw=randwrite
+bs=4k
+iodepth=32
+size=512m
+runtime=30
+time_based=1
+group_reporting=1
+
+[randwrite-4k-qd32]
+numjobs=1

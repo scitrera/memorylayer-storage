@@ -1,0 +1,19 @@
+# Local output and credentials
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+bin/
+dist/
+build/
+coverage.out
+.env
+.env.*
+!.env.example
+*.creds
+*.key
+*.pem
+*.log
+.DS_Store

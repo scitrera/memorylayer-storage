@@ -1,0 +1,79 @@
+# Two-node mlfs cluster for the tc network-partition self-fence test (L2.8).
+# Topology: a Postgres pod (shared SoR) + a single NATS/JetStream pod (shared
+# coordination plane, external-NATS mode) + two mlfs daemons as NATS clients.
+# Using one external NATS avoids embedded-JetStream cluster-formation races and
+# is a supported mode (-nats-url). Partitioning one daemon with `tc` (privileged
+# → NET_ADMIN) cuts it off from both NATS and PG, demonstrating that it loses its
+# lease and its writes are fenced while the survivor takes over.
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: mlfs-pg, namespace: default, labels: { app: mlfs-pg } }
+spec:
+  containers:
+    - name: pg
+      image: postgres:16-alpine
+      env:
+        - { name: POSTGRES_DB, value: mlfs }
+        - { name: POSTGRES_HOST_AUTH_METHOD, value: trust }
+      ports: [{ containerPort: 5432 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mlfs-pg, namespace: default }
+spec:
+  selector: { app: mlfs-pg }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: nats, namespace: default, labels: { app: nats } }
+spec:
+  containers:
+    - name: nats
+      image: nats:2.10-alpine
+      args: ["-js"]
+      ports: [{ containerPort: 4222 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: nats, namespace: default }
+spec:
+  selector: { app: nats }
+  ports: [{ port: 4222, targetPort: 4222 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: mlfs, namespace: default }
+spec:
+  serviceName: mlfs
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: mlfs } }
+  template:
+    metadata: { labels: { app: mlfs } }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: mlfs
+          image: mlfs:dev
+          imagePullPolicy: IfNotPresent
+          securityContext: { privileged: true }   # FUSE mount + (for the test) tc/NET_ADMIN
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /mnt/mlfs /data/cas /data/cache
+              exec /usr/local/bin/mlfs \
+                -mount=/mnt/mlfs \
+                -meta-dsn="postgres://postgres@mlfs-pg:5432/mlfs?sslmode=disable" \
+                -data-dir=/data/cas -cache-dir=/data/cache \
+                -node-id="$HOSTNAME" \
+                -nats-url="nats://nats:4222" \
+                -lease-ttl=6s -lease-refresh=2s
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: mnt, mountPath: /mnt }
+      volumes:
+        - { name: data, emptyDir: {} }
+        - { name: mnt, emptyDir: {} }

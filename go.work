@@ -1,0 +1,23 @@
+go 1.26.8
+
+toolchain go1.26.8
+
+use (
+	./blobgw
+	./blobgw-edge
+	./blobgw-s3
+	./casstore
+	./ctlproto
+	./manifeststore
+	./mlfs
+	./mlfs-csi
+)
+
+// BEGIN repo-tools local module replacements
+replace (
+	github.com/scitrera/memorylayer-storage/blobgw v0.7.1 => ./blobgw
+	github.com/scitrera/memorylayer-storage/casstore v0.7.1 => ./casstore
+	github.com/scitrera/memorylayer-storage/ctlproto v0.7.1 => ./ctlproto
+	github.com/scitrera/memorylayer-storage/manifeststore v0.7.1 => ./manifeststore
+)
+// END repo-tools local module replacements

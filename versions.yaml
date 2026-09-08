@@ -1,0 +1,140 @@
+# Component versions are independent. Adopt sibling dependency updates explicitly.
+memorylayer-storage: 0.7.1
+casstore: 0.7.1
+ctlproto: 0.7.1
+manifeststore: 0.7.1
+blobgw: 0.7.1
+blobgw-edge: 0.7.1
+blobgw-s3: 0.7.1
+mlfs: 0.7.1
+mlfs-csi: 0.7.1
+blobgw-client: 0.7.1
+project_rules:
+  memorylayer-storage:
+  - type: gowork
+    path: go.work
+  casstore:
+  - type: gomod
+    path: casstore/go.mod
+  ctlproto:
+  - type: gomod
+    path: ctlproto/go.mod
+  manifeststore:
+  - type: gomod
+    path: manifeststore/go.mod
+  blobgw:
+  - type: gomod
+    path: blobgw/go.mod
+  blobgw-edge:
+  - type: gomod
+    path: blobgw-edge/go.mod
+  blobgw-s3:
+  - type: gomod
+    path: blobgw-s3/go.mod
+  mlfs:
+  - type: gomod
+    path: mlfs/go.mod
+  mlfs-csi:
+  - type: gomod
+    path: mlfs-csi/go.mod
+  blobgw-client:
+  - type: pyproject
+    path: clients/python/pyproject.toml
+  - type: init_py
+    path: clients/python/src/blobgw_client/__init__.py
+go_toolchain:
+  go: 1.26.8
+ci:
+  test_branches:
+  - main
+  push_branches:
+  - main
+  release_mode: independent
+  # The Python client is distributed from its Git tag; retain its test workflow.
+  skip_workflows:
+  - release-blobgw-client
+  repo_tools_source: scitrera-repo-tools==0.1.29
+  github_release: true
+  go:
+    lint: none
+    enable_govulncheck: true
+    test_args: -race -count=1 -timeout=10m
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: storage
+          POSTGRES_PASSWORD: storage
+          POSTGRES_DB: storage
+        ports:
+        - 5432:5432
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s
+          --health-retries 10
+    env:
+      MLFS_TEST_DATABASE_URL: postgres://storage:storage@localhost:5432/storage?sslmode=disable
+      BLOBGW_TEST_DATABASE_URL: postgres://storage:storage@localhost:5432/storage?sslmode=disable
+    setup_steps:
+    - name: Check formatting
+      run: test -z "$(gofmt -l .)"
+    govulncheck_version: v1.3.0
+  python:
+    test_versions:
+    - '3.10'
+    - '3.11'
+    - '3.12'
+    - '3.13'
+    - '3.14'
+    lint: none
+    setup_steps:
+    - name: Select Go for real gateway tests
+      run: 'echo /usr/local/go/bin >> "$GITHUB_PATH"
+
+        /usr/local/go/bin/go version'
+  docker:
+    default_platforms:
+    - linux/amd64
+    - linux/arm64
+    platform_runners:
+      linux/amd64: ubuntu-latest
+      linux/arm64: ubuntu-24.04-arm
+    enable_workflow_dispatch_version: false
+    test_prereqs:
+    - go
+  check_generated_ci: true
+docker:
+  ghcr: scitrera
+  images:
+    blobgw:
+      context: .
+      dockerfile: docker/Dockerfile.blobgw
+      version_from: blobgw
+      build_args:
+        VERSION: ${image_version}
+    blobgw-edge:
+      context: .
+      dockerfile: docker/Dockerfile.blobgw-edge
+      version_from: blobgw-edge
+      build_args:
+        VERSION: ${image_version}
+    blobgw-s3:
+      context: .
+      dockerfile: docker/Dockerfile.blobgw-s3
+      version_from: blobgw-s3
+      build_args:
+        VERSION: ${image_version}
+    mlfs:
+      context: .
+      dockerfile: docker/Dockerfile.mlfs
+      version_from: mlfs
+      build_args:
+        VERSION: ${image_version}
+    mlfs-csi:
+      context: .
+      dockerfile: docker/Dockerfile.mlfs-csi
+      version_from: mlfs-csi
+      build_args:
+        VERSION: ${image_version}
+preferred_versions:
+  go:
+    google.golang.org/grpc: v1.82.1
+    golang.org/x/text: v0.39.0

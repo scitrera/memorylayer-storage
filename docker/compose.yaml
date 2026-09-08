@@ -1,0 +1,32 @@
+name: memorylayer-storage-dev
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: storage
+      POSTGRES_PASSWORD: storage
+      POSTGRES_DB: storage
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes: ["postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storage"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  blobgw:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.blobgw
+    command: ["-addr", ":8080", "-domain", "demo", "-backend", "local", "-data-dir", "/data", "-index", "postgres", "-database-url", "postgres://storage:storage@postgres:5432/storage?sslmode=disable", "-staging", "memory", "-gc-interval", "0"]
+    ports: ["127.0.0.1:${BLOBGW_PORT:-8080}:8080"]
+    volumes: ["objects:/data"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  postgres:
+  objects:

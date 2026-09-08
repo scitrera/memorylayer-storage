@@ -1,0 +1,10 @@
+# kind cluster for mlfs CSI acceptance. /dev/fuse is mounted into the node so a
+# privileged mlfs daemon pod can mount FUSE; the CSI driver itself only needs
+# bind-mount (CAP_SYS_ADMIN via privileged).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: /dev/fuse
+        containerPath: /dev/fuse

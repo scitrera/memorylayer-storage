@@ -1,0 +1,17 @@
+# 8-way parallel 1 MiB sequential read — the "model loading" profile (a loader
+# pulling many weight shards at once). Unlike seqread-1m (single stream, bound by
+# the 1 MiB readahead window), aggregate throughput here is bound by how many
+# reads the kernel keeps in flight = FUSE MaxBackground. Raise mlfs -max-background
+# on read-heavy (e.g. GPU) nodes; see docs/operations.md. Run via run-fio.sh.
+[global]
+ioengine=libaio
+direct=0
+rw=read
+bs=1m
+size=512m
+runtime=30
+time_based=1
+group_reporting=1
+
+[parread-1m-x8]
+numjobs=8

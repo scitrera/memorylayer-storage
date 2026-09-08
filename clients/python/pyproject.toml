@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blobgw-client"
+version = "0.7.1"
+description = "Python client for the blobgw object gateway (L1 of the casstore storage platform)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# Zero runtime dependencies: the client uses only the standard library so it
+# can be vendored into any service (e.g. memorylayer-enterprise) without
+# pulling a transitive tree.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.urls]
+Repository = "https://github.com/scitrera/memorylayer-storage"
+Issues = "https://github.com/scitrera/memorylayer-storage/issues"
