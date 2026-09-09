@@ -82,3 +82,7 @@ The storage stack is licensed under [AGPL-3.0-only](LICENSE).
 The Python client in `clients/python/` is licensed under
 [Apache-2.0](clients/python/LICENSE). Dependencies retain their own licenses;
 see [third-party notices](THIRD_PARTY_NOTICES.md).
+
+Contributions are governed by [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[MemoryLayer Storage Contributor License Agreement](CLA.md), with Scitrera LLC as
+the sole Project Owner.
