@@ -246,3 +246,13 @@ func TestLoadProvider_BadConfigPath(t *testing.T) {
 		t.Fatal("bad config path: want error, got nil")
 	}
 }
+
+func TestPathStyleResolverReachesStaticBinding(t *testing.T) {
+	file := &tenantconfig.File{Tenants: map[string]tenantconfig.TenantRecord{
+		"local": {Endpoint: "http://objects:9000", Region: "us-east-1", Bucket: "tenant-local", CredentialRef: "local", ForcePathStyle: true},
+	}}
+	desc, err := file.Resolver().Resolve(context.Background(), "local")
+	if err != nil || !desc.ForcePathStyle {
+		t.Fatalf("descriptor lost endpoint policy: %v", err)
+	}
+}

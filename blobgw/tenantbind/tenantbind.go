@@ -74,11 +74,13 @@ type Creds struct {
 // to mint presigned URLs (ADR §2.9). Use ToBlobstoreS3Config / ToSnapshotS3Config
 // to feed it into casstore.
 type Binding struct {
-	Endpoint string
-	Region   string
-	Bucket   string
-	Prefix   string
-	Creds    Creds
+	// ForcePathStyle selects path-style S3 addressing for a private object endpoint.
+	ForcePathStyle bool
+	Endpoint       string
+	Region         string
+	Bucket         string
+	Prefix         string
+	Creds          Creds
 	// ManifestDSN is the optional per-tenant PostgreSQL DSN for slice-manifest
 	// routing: when non-empty this tenant's manifests live in its own meta DB (the
 	// converged mlfs -remote posture) and the per-tenant backend builds a PG
@@ -95,11 +97,12 @@ type Binding struct {
 // AWS impl. It models the ADR §2.9 requirement that the tenant→binding resolver
 // is mandatory (not derivable) because the bucket/role name carries a nonce.
 type Descriptor struct {
-	Endpoint      string
-	Region        string
-	Bucket        string
-	Prefix        string
-	CredentialRef string
+	ForcePathStyle bool
+	Endpoint       string
+	Region         string
+	Bucket         string
+	Prefix         string
+	CredentialRef  string
 	// ManifestDSN is the optional per-tenant PostgreSQL DSN for slice-manifest
 	// routing (the converged mlfs -remote posture: this tenant's manifests live in
 	// its own meta DB, not S3). It is copied into the resolved Binding. Empty is the

@@ -75,11 +75,12 @@ type File struct {
 // provisioning-published locator for one tenant's backend bucket plus the
 // reference used to fetch that tenant's scoped credential.
 type TenantRecord struct {
-	Endpoint      string `json:"endpoint"`
-	Region        string `json:"region"`
-	Bucket        string `json:"bucket"`
-	Prefix        string `json:"prefix"`
-	CredentialRef string `json:"credentialRef"`
+	ForcePathStyle bool   `json:"forcePathStyle,omitempty"`
+	Endpoint       string `json:"endpoint"`
+	Region         string `json:"region"`
+	Bucket         string `json:"bucket"`
+	Prefix         string `json:"prefix"`
+	CredentialRef  string `json:"credentialRef"`
 	// ManifestDSN is the optional per-tenant PostgreSQL DSN for slice-manifest
 	// routing: non-empty routes this tenant's manifests to its own meta DB (the
 	// converged mlfs -remote posture), empty keeps the S3 manifest store. Folding it
@@ -317,12 +318,13 @@ func (f *File) Resolver() *tenantbind.MapResolver {
 	r := tenantbind.NewMapResolver()
 	for tenant, rec := range f.Tenants {
 		r.Set(tenant, tenantbind.Descriptor{
-			Endpoint:      rec.Endpoint,
-			Region:        rec.Region,
-			Bucket:        rec.Bucket,
-			Prefix:        rec.Prefix,
-			CredentialRef: rec.CredentialRef,
-			ManifestDSN:   rec.ManifestDSN,
+			Endpoint:       rec.Endpoint,
+			ForcePathStyle: rec.ForcePathStyle,
+			Region:         rec.Region,
+			Bucket:         rec.Bucket,
+			Prefix:         rec.Prefix,
+			CredentialRef:  rec.CredentialRef,
+			ManifestDSN:    rec.ManifestDSN,
 		})
 	}
 	return r
