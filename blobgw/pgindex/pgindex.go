@@ -136,10 +136,22 @@ CREATE TABLE IF NOT EXISTS pack_assoc_backfill (
 );
 `
 
-// Migrate creates the tables if they don't exist.
+// Migrate serializes initialization across gateway/edge replicas in this schema.
+// CREATE TABLE IF NOT EXISTS alone can still race on PostgreSQL's type catalog.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, Schema); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("pgindex: migrate begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext('blobgw.pgindex.migrate'), hashtext(current_schema()))"); err != nil {
+		return fmt.Errorf("pgindex: migrate lock: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, Schema); err != nil {
 		return fmt.Errorf("pgindex: migrate: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("pgindex: migrate commit: %w", err)
 	}
 	return nil
 }
