@@ -61,6 +61,18 @@ const apiV1 = "/v1"
 // Option configures the server constructed by New.
 type Option func(*server)
 
+// TenantRouter selects the gateway for a trusted internal caller's tenant.
+// This is routing, not authentication: expose this server only to trusted services.
+type TenantRouter interface {
+	ForCtx(context.Context, string) (*gateway.Gateway, error)
+}
+
+// WithTenantRouter requires X-Blobgw-Domain on every data-plane request and
+// resolves it through the configured tenant bindings. It never falls back to gw.
+func WithTenantRouter(router TenantRouter) Option {
+	return func(s *server) { s.router = router }
+}
+
 // WithReadiness wires the dependency probe backing GET /readyz. ready should
 // return nil only when every backing dependency the gateway needs (its index
 // and chunk backend) is reachable; a non-nil error makes /readyz return 503.
@@ -251,6 +263,7 @@ type opHolder struct {
 // the middleware) it is a thin passthrough; with no TracerProvider the span is a
 // global no-op (zero overhead when tracing is off).
 func (s *server) withOp(op string, handler http.HandlerFunc) http.HandlerFunc {
+	handler = s.withTenant(handler)
 	return func(w http.ResponseWriter, r *http.Request) {
 		h, ok := r.Context().Value(opContextKey{}).(*opHolder)
 		if !ok {
@@ -306,7 +319,49 @@ func (s *server) middleware(next http.Handler) http.Handler {
 	})
 }
 
+type gatewayContextKey struct{}
+
+func (s *server) requestGateway(r *http.Request) *gateway.Gateway {
+	return r.Context().Value(gatewayContextKey{}).(*gateway.Gateway)
+}
+
+func (s *server) withTenant(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		values := r.Header.Values("X-Blobgw-Domain")
+		domain := r.Header.Get("X-Blobgw-Domain")
+		if len(values) > 1 || strings.Contains(domain, ",") || domain != strings.TrimSpace(domain) {
+			httpx.WriteError(w, http.StatusBadRequest, "invalid X-Blobgw-Domain")
+			return
+		}
+		gw := s.gw
+		if s.router != nil {
+			if domain == "" {
+				httpx.WriteError(w, http.StatusBadRequest, "X-Blobgw-Domain is required")
+				return
+			}
+			var err error
+			gw, err = s.router.ForCtx(r.Context(), domain)
+			if err != nil || gw == nil || gw.Domain() != domain {
+				// Binding errors can contain credentials or backend details.
+				httpx.WriteError(w, http.StatusServiceUnavailable, "tenant storage unavailable")
+				return
+			}
+		} else if domain != "" && (gw == nil || domain != gw.Domain()) {
+			// Legacy single-domain mode must not silently acknowledge another tenant.
+			httpx.WriteError(w, http.StatusBadRequest, "X-Blobgw-Domain does not match this gateway")
+			return
+		}
+		if gw == nil {
+			httpx.WriteError(w, http.StatusServiceUnavailable, "storage unavailable")
+			return
+		}
+		w.Header().Set("X-Blobgw-Domain", gw.Domain())
+		next(w, r.WithContext(context.WithValue(r.Context(), gatewayContextKey{}, gw)))
+	}
+}
+
 type server struct {
+	router  TenantRouter
 	gw      *gateway.Gateway
 	logger  *slog.Logger
 	ready   func(ctx context.Context) error
@@ -484,7 +539,7 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
-	info, err := s.gw.Put(r.Context(), ref, ct, r.Body)
+	info, err := s.requestGateway(r).Put(r.Context(), ref, ct, r.Body)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -496,7 +551,7 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request) {
-	rc, info, err := s.gw.Get(r.Context(), r.PathValue("ref"))
+	rc, info, err := s.requestGateway(r).Get(r.Context(), r.PathValue("ref"))
 	if err != nil {
 		// A data-integrity fault can surface from the manifest resolve before any
 		// body streams (e.g. a referenced pack missing). Classify + count it as the
@@ -535,7 +590,7 @@ func (s *server) recordIntegrity(r *http.Request, err error) {
 }
 
 func (s *server) head(w http.ResponseWriter, r *http.Request) {
-	info, err := s.gw.Head(r.Context(), r.PathValue("ref"))
+	info, err := s.requestGateway(r).Head(r.Context(), r.PathValue("ref"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -546,7 +601,7 @@ func (s *server) head(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {
-	if err := s.gw.Delete(r.Context(), r.PathValue("ref")); err != nil {
+	if err := s.requestGateway(r).Delete(r.Context(), r.PathValue("ref")); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -570,7 +625,7 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	objs, next, err := s.gw.ListPage(r.Context(), r.URL.Query().Get("prefix"), r.URL.Query().Get("after"), limit)
+	objs, next, err := s.requestGateway(r).ListPage(r.Context(), r.URL.Query().Get("prefix"), r.URL.Query().Get("after"), limit)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -595,7 +650,7 @@ func (s *server) deletePrefix(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "prefix query param is required for bulk delete")
 		return
 	}
-	deleted, err := s.gw.DeletePrefix(r.Context(), prefix)
+	deleted, err := s.requestGateway(r).DeletePrefix(r.Context(), prefix)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -629,7 +684,7 @@ func (s *server) mint(w http.ResponseWriter, r *http.Request) {
 	if ttl <= 0 {
 		ttl = 15 * time.Minute
 	}
-	staged, err := s.gw.MintRefWithOptions(r.Context(), req.Ref, gateway.MintOptions{
+	staged, err := s.requestGateway(r).MintRefWithOptions(r.Context(), req.Ref, gateway.MintOptions{
 		ContentType:  req.ContentType,
 		MaxSize:      req.MaxSize,
 		TTL:          ttl,
@@ -653,7 +708,7 @@ func (s *server) finalize(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	info, err := s.gw.Finalize(r.Context(), req.Ref)
+	info, err := s.requestGateway(r).Finalize(r.Context(), req.Ref)
 	if err != nil {
 		writeErr(w, err)
 		return

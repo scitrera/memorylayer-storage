@@ -13,6 +13,26 @@ Run each daemon with `-help` to see its configuration flags. The `docker/`
 directory contains a build definition for each daemon; every build uses the
 repository root as its context so all workspace modules are available.
 
+## Internal multi-tenant object API
+
+Passing `-tenant-config` enables tenant routing for the HTTP `/v1` object API,
+independently of `-control-plane`. Use the same tenant bindings, S3 credentials,
+PostgreSQL index and staging store as blobgw-edge. Every data request must supply
+one `X-Blobgw-Domain` header naming a configured tenant. Missing or unresolvable
+tenants fail closed; there is no fallback to `-domain`. Successful responses
+include `X-Blobgw-Domain` so clients and migrations can verify the destination.
+Without `-tenant-config`, the single-domain API still accepts headerless requests
+but rejects an explicit domain that differs from `-domain`.
+
+This header selects storage; it does not authenticate callers. Keep port 8080
+restricted to trusted services. Browsers use the authenticated capability edge.
+Verify both the response domain and read-back hashes when migrating objects.
+
+The shared-store `-gc-interval` sweeper is disabled with tenant bindings because
+it cannot establish liveness in separate tenant backends. Use the existing
+per-tenant `-control-plane -gc-leader` runner for scheduled collection, or the
+scoped administrative GC endpoint during maintenance.
+
 ## Remote filesystem deployments
 
 A remote deployment needs S3-compatible object storage, PostgreSQL metadata and

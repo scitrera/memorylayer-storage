@@ -255,3 +255,32 @@ func TestLoadManifestDSNs(t *testing.T) {
 		}
 	})
 }
+
+// Tenant bindings must work with the HTTP-only deployment; NATS is optional.
+func TestBuild_TenantRoutingWithoutControlPlane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := defaultOptions(t.TempDir())
+	o.credentialMode = "static"
+	o.tenantConfig = writeFile(t, "tenants.json", `{"tenants":{"alpha":{"endpoint":"http://127.0.0.1:1","region":"us-east-1","bucket":"alpha","prefix":"packs","credentialRef":"alpha","forcePathStyle":true}}}`)
+	o.tenantSecretsFile = writeFile(t, "secrets.json", `{"alpha":{"accessKey":"test","secretKey":"test"}}`)
+	b, err := build(ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.cleanup()
+	if b.router == nil || b.provider == nil {
+		t.Fatal("HTTP-only tenant routing was not initialized")
+	}
+	_, err = b.provider.BindingFor(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("tenant binding: %v", err)
+	}
+	if _, err := b.router.ForCtx(ctx, "unknown"); err == nil {
+		t.Fatal("unknown tenant bound")
+	}
+	o.tenantConfig = writeFile(t, "invalid.json", `invalid JSON`)
+	if _, err := build(ctx, o); err == nil {
+		t.Fatal("bad tenant config was silently ignored")
+	}
+}
