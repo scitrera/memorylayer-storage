@@ -112,9 +112,8 @@ func (b Binding) ToBlobstoreS3Config() blobstore.S3Config {
 // endpoint is normalized to a valid URI the aws-sdk-go-v2 client accepts
 // (ensureScheme): a non-empty scheme-less host gets an https:// prefix, a value
 // that already carries a scheme passes through, and an empty endpoint stays empty
-// so the SDK derives it from the region. ForcePathStyle is left at its zero value
-// (false = AWS virtual-host style); it is an endpoint-shape concern (RustFS), not
-// part of the credential binding.
+// so the SDK derives it from the region. ForcePathStyle is operator-selected
+// per endpoint; its false default preserves AWS virtual-host addressing.
 //
 // Creds.SessionToken IS mapped now that casstore's snapshot.S3Config
 // (s3util.Config) carries a SessionToken field (ADR §7.8): it threads the token
@@ -124,12 +123,13 @@ func (b Binding) ToBlobstoreS3Config() blobstore.S3Config {
 // maps through as empty, preserving the pre-existing behavior.
 func (b Binding) ToSnapshotS3Config() snapshot.S3Config {
 	return snapshot.S3Config{
-		Bucket:       b.Bucket,
-		Prefix:       b.Prefix,
-		Region:       b.Region,
-		Endpoint:     ensureScheme(b.Endpoint),
-		AccessKey:    b.Creds.AccessKeyID,
-		SecretKey:    b.Creds.SecretAccessKey,
-		SessionToken: b.Creds.SessionToken,
+		ForcePathStyle: b.ForcePathStyle,
+		Bucket:         b.Bucket,
+		Prefix:         b.Prefix,
+		Region:         b.Region,
+		Endpoint:       ensureScheme(b.Endpoint),
+		AccessKey:      b.Creds.AccessKeyID,
+		SecretKey:      b.Creds.SecretAccessKey,
+		SessionToken:   b.Creds.SessionToken,
 	}
 }

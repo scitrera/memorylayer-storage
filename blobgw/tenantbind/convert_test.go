@@ -116,3 +116,12 @@ func TestEnsureScheme(t *testing.T) {
 		}
 	}
 }
+
+func TestManifestPathStyleIsExplicitAndDefaultsToVirtualHost(t *testing.T) {
+	if (Binding{}).ToSnapshotS3Config().ForcePathStyle {
+		t.Fatal("default changed")
+	}
+	if !(Binding{ForcePathStyle: true}).ToSnapshotS3Config().ForcePathStyle {
+		t.Fatal("path style lost")
+	}
+}

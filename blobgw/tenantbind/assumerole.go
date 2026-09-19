@@ -78,12 +78,13 @@ func (p *AssumeRoleProvider) BindingFor(ctx context.Context, tenant string) (Bin
 		return Binding{}, fmt.Errorf("tenantbind: assume role for %q (role %q): %w", tenant, desc.CredentialRef, err)
 	}
 	return Binding{
-		Endpoint:    desc.Endpoint,
-		Region:      desc.Region,
-		Bucket:      desc.Bucket,
-		Prefix:      desc.Prefix,
-		ManifestDSN: desc.ManifestDSN,
-		Creds:       creds,
+		Endpoint:       desc.Endpoint,
+		ForcePathStyle: desc.ForcePathStyle,
+		Region:         desc.Region,
+		Bucket:         desc.Bucket,
+		Prefix:         desc.Prefix,
+		ManifestDSN:    desc.ManifestDSN,
+		Creds:          creds,
 	}, nil
 }
 

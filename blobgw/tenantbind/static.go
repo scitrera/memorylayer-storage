@@ -48,11 +48,12 @@ func (p *StaticKeysProvider) BindingFor(ctx context.Context, tenant string) (Bin
 		return Binding{}, fmt.Errorf("tenantbind: fetch secret for %q (ref %q): %w", tenant, desc.CredentialRef, err)
 	}
 	return Binding{
-		Endpoint:    desc.Endpoint,
-		Region:      desc.Region,
-		Bucket:      desc.Bucket,
-		Prefix:      desc.Prefix,
-		ManifestDSN: desc.ManifestDSN,
+		Endpoint:       desc.Endpoint,
+		ForcePathStyle: desc.ForcePathStyle,
+		Region:         desc.Region,
+		Bucket:         desc.Bucket,
+		Prefix:         desc.Prefix,
+		ManifestDSN:    desc.ManifestDSN,
 		Creds: Creds{
 			AccessKeyID:     ak,
 			SecretAccessKey: sk,
