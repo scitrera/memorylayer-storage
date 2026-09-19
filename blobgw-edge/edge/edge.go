@@ -610,6 +610,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, gw *gateway.G
 		return
 	}
 	defer rc.Close()
+	// Bind a read capability to the object version observed at mint time.
+	// Get resolves metadata and its reader together; do not HEAD then GET,
+	// which would permit a ref replacement between the two operations.
+	if c.ContentHash != "" && info.ContentHash != c.ContentHash {
+		s.deny(w, r, c, liveSub, ref, http.StatusPreconditionFailed, "content changed")
+		return
+	}
+	if c.ContentHash != "" {
+		w.Header().Set("Cache-Control", "private, no-store")
+	}
 	httpx.SetObjectHeaders(w, info)
 	w.WriteHeader(http.StatusOK)
 	n, copyErr := io.Copy(w, rc)
@@ -628,6 +638,13 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, gw *gateway.
 	if err != nil {
 		s.gatewayErr(w, r, c, liveSub, ref, err)
 		return
+	}
+	if c.ContentHash != "" && info.ContentHash != c.ContentHash {
+		s.deny(w, r, c, liveSub, ref, http.StatusPreconditionFailed, "content changed")
+		return
+	}
+	if c.ContentHash != "" {
+		w.Header().Set("Cache-Control", "private, no-store")
 	}
 	httpx.SetObjectHeaders(w, info)
 	w.WriteHeader(http.StatusOK)
