@@ -41,6 +41,7 @@ import (
 	"github.com/scitrera/memorylayer-storage/blobgw/pgindex"
 	"github.com/scitrera/memorylayer-storage/blobgw/s3stage"
 	"github.com/scitrera/memorylayer-storage/blobgw/server"
+	"github.com/scitrera/memorylayer-storage/blobgw/tenantbind"
 	"github.com/scitrera/memorylayer-storage/blobgw/tenantconfig"
 	"github.com/scitrera/memorylayer-storage/casstore/blobstore"
 	"github.com/scitrera/memorylayer-storage/casstore/blobstore/obs"
@@ -79,14 +80,11 @@ type options struct {
 	stagingBucket string
 	stagingPrefix string
 
-	// Control plane (NATS face, ADR §2.5/§2.9). All default OFF: when
-	// controlPlane is false the daemon is the existing HTTP-only object server
-	// and none of these are consulted.
+	// Tenant bindings also route HTTP I/O; the optional NATS face uses the same provider.
 	controlPlane       bool
 	natsURL            string
 	natsCreds          string
 	natsNKey           string
-	httpTenantRouting  bool
 	tenantConfig       string
 	tenantSecretsFile  string
 	credentialMode     string
@@ -170,10 +168,9 @@ func main() {
 	// account. See docs/blobgw-control-plane-accounts.md.
 	flag.StringVar(&o.natsCreds, "nats-creds", "", "path to a NATS credentials file selecting the blobgw control-plane (service) account (control-plane=true; ADR §7.7). Empty = legacy single-account.")
 	flag.StringVar(&o.natsNKey, "nats-nkey", "", "path to a NATS nkey seed file selecting the blobgw control-plane (service) account (control-plane=true; alternative to -nats-creds). Empty = legacy single-account.")
-	flag.BoolVar(&o.httpTenantRouting, "http-tenant-routing", false, "route internal HTTP data requests by X-Blobgw-Domain using -tenant-config; independent of NATS")
-	flag.StringVar(&o.tenantConfig, "tenant-config", "", "path to per-tenant resolver records for HTTP and optional control plane: EITHER a single JSON file OR a DIRECTORY of per-tenant *.json files (each hot-reloaded, one file per tenant for onboarding); see tenantconfig schema (ADR §2.9). Each record may carry an optional manifestDSN (per-tenant PG manifest routing), superseding -manifest-dsn-file")
+	flag.StringVar(&o.tenantConfig, "tenant-config", "", "path to the per-tenant resolver records (enables HTTP tenant routing; also used by the optional control plane): EITHER a single JSON file OR a DIRECTORY of per-tenant *.json files (each hot-reloaded, one file per tenant for onboarding); see tenantconfig schema (ADR §2.9). Each record may carry an optional manifestDSN (per-tenant PG manifest routing), superseding -manifest-dsn-file")
 	flag.StringVar(&o.tenantSecretsFile, "tenant-secrets-file", "", "optional JSON file mapping credentialRef → {accessKey,secretKey}; env BLOBGW_TENANT_KEY_*/SECRET_* take precedence (credential-mode=static only)")
-	flag.StringVar(&o.credentialMode, "credential-mode", string(tenantconfig.CredentialModeStatic), "per-tenant credential source: static (credentialRef = secret ref; dev + non-AWS prod) | aws-sts (credentialRef = IAM role ARN, STS-assumed via IRSA web-identity token; requires AWS_WEB_IDENTITY_TOKEN_FILE in the pod) (ADR §2.9)")
+	flag.StringVar(&o.credentialMode, "credential-mode", string(tenantconfig.CredentialModeStatic), "per-tenant credential source (-tenant-config): static (credentialRef = secret ref; dev + non-AWS prod) | aws-sts (credentialRef = IAM role ARN, STS-assumed via IRSA web-identity token; requires AWS_WEB_IDENTITY_TOKEN_FILE in the pod) (ADR §2.9)")
 	flag.DurationVar(&o.credentialCacheTTL, "credential-cache-ttl", tenantconfig.DefaultCacheTTL, "per-tenant credential cache TTL; doubles as the secret-rotation pickup (ADR §2.9). In aws-sts mode the cache also refreshes before STS session expiry")
 	flag.DurationVar(&o.presignMaxTTL, "presign-max-ttl", 15*time.Minute, "cap on minted presigned-URL validity (ADR §2.9); effective TTL = min(requested, cap)")
 
@@ -196,11 +193,6 @@ func main() {
 	flag.Float64Var(&o.otelTraceSampling, "otel-trace-sampling", 1.0, "head-sampling ratio for distributed traces (parent-based): 1.0 = every root trace, 0.0 = none. Only effective with -otel-endpoint (traces need a collector); a sampled upstream caller's trace is always continued regardless")
 	flag.Parse()
 
-	if o.httpTenantRouting && o.tenantConfig == "" {
-		slog.Error("blobgw: -http-tenant-routing requires -tenant-config")
-		os.Exit(1)
-	}
-
 	if o.gcLeader && !o.controlPlane {
 		slog.Error("blobgw: -gc-leader requires -control-plane (needs the per-tenant router + NATS)")
 		os.Exit(1)
@@ -218,7 +210,7 @@ func main() {
 
 	// Optionally bring up the NATS control-plane face (ADR §2.5/§2.9) alongside
 	// the HTTP data path. Default OFF: when -control-plane is not passed the
-	// daemon is the existing HTTP-only object server, unchanged.
+	// daemon serves only HTTP, using tenant bindings when configured.
 	if o.controlPlane {
 		stopCP, err := startControlPlane(ctx, o, b)
 		if err != nil {
@@ -228,33 +220,23 @@ func main() {
 		defer stopCP()
 	}
 
-	// HTTP-only installations also need per-tenant bindings. Previously the
-	// tenant config was silently ignored unless the optional NATS face was on.
-	if o.httpTenantRouting && !o.controlPlane {
-		router, err := buildHTTPTenantRouter(ctx, o, b)
-		if err != nil {
-			slog.Error("blobgw: HTTP tenant routing init", "err", err)
-			os.Exit(1)
-		}
-		b.router = router
-		defer router.Close()
-	}
-
-	if o.gcInterval > 0 {
+	// The shared-store sweeper cannot establish liveness in tenant backends.
+	// Multi-tenant deployments use the per-tenant GC runner or admin GC.
+	if o.gcInterval > 0 && b.router == nil {
 		go b.gc.Loop(ctx, o.gcInterval)
 	}
 	// The staging sweeper shares the chunked-GC interval; -staging-ttl gates how
 	// old a pending slot must be before it is reclaimed.
-	if b.stagingGC != nil && o.gcInterval > 0 && o.stagingTTL > 0 {
+	if b.router == nil && b.stagingGC != nil && o.gcInterval > 0 && o.stagingTTL > 0 {
 		go b.stagingGC.Loop(ctx, o.gcInterval)
 	}
 
 	// Admin maintenance endpoints (pack-size backfill + on-demand per-tenant GC)
-	// are wired here, AFTER control-plane setup has populated b.router, so a real
+	// use the same tenant router as the HTTP data path, so a real
 	// per-tenant backfill/GC resolves the tenant's OWN backend through the router
 	// (ADR §2.6) rather than the shared/placeholder store. Backfill needs the
 	// pgindex Store's PackSizeRecorder (only the postgres index satisfies it);
-	// GC needs the per-tenant router (only the -control-plane posture builds one).
+	// GC needs the per-tenant router (-tenant-config).
 	srvOpts := []server.Option{
 		server.WithReadiness(b.ready),
 		server.WithLogger(slog.Default()),
@@ -266,10 +248,8 @@ func main() {
 			router: b.router, chunks: b.chunks, rec: b.dedup, logger: slog.Default(),
 		}))
 	}
-	if o.httpTenantRouting {
-		srvOpts = append(srvOpts, server.WithTenantRouter(b.router))
-	}
 	if b.router != nil {
+		srvOpts = append(srvOpts, server.WithTenantRouter(b.router))
 		// Use the leader-elected safety window when configured; else the GC default
 		// (never reclaim a pack younger than this — guards the GC↔in-flight-write race).
 		safetyWindow := o.gcLeaderSafetyWindow
@@ -572,7 +552,7 @@ func build(ctx context.Context, o options) (*built, error) {
 		}
 		return nil
 	}
-	return &built{
+	b := &built{
 		gw:        gw,
 		gc:        gc,
 		stagingGC: stagingGC,
@@ -585,7 +565,14 @@ func build(ctx context.Context, o options) (*built, error) {
 		chunks:    chunks,
 		metrics:   reg,
 		dataPath:  dataPath,
-	}, nil
+	}
+	if o.tenantConfig != "" {
+		if err := setupTenantRouting(ctx, o, b); err != nil {
+			return fail(err)
+		}
+		cleanups = append(cleanups, func() { _ = b.router.Close() })
+	}
+	return b, nil
 }
 
 // built bundles the assembled HTTP data-path components (gw/gc/stagingGC/ready)
@@ -612,12 +599,10 @@ type built struct {
 	// tenant's OWN backend through the router instead.
 	chunks blobstore.Storage
 
-	// router is the per-tenant TenantRouter built during control-plane setup
-	// (WithBindingProvider). Non-nil only under -control-plane; it lets the
-	// backfill + GC admin adapters resolve each tenant's OWN backend (ADR §2.6),
-	// exactly as the leader-elected GC sweeper does. nil in the HTTP-only /
-	// single-tenant posture, in which case the adapters fall back to b.chunks.
-	router *gateway.TenantRouter
+	// Tenant routing is configured independently of NATS and shared by HTTP,
+	// control-plane and maintenance operations. Nil in single-domain mode.
+	router   *gateway.TenantRouter
+	provider tenantbind.Provider
 
 	// usage backs GET /admin/usage. Non-nil only when the selected index exposes
 	// per-domain storage accounting (the pgindex Store); nil for the in-memory
@@ -715,33 +700,54 @@ func (p pgGC) RunGCForDomain(ctx context.Context, domain string) (server.GCSumma
 	}, nil
 }
 
+// setupTenantRouting enables HTTP tenant bindings even without a NATS control
+// plane. build owns the router's lifetime; every surface shares its caches.
+func setupTenantRouting(ctx context.Context, o options, b *built) error {
+	mode, err := tenantconfig.ParseCredentialMode(o.credentialMode)
+	if err != nil {
+		return err
+	}
+	manifestDSNs, err := loadManifestDSNs(o.manifestDSNFile)
+	if err != nil {
+		return fmt.Errorf("load manifest DSNs: %w", err)
+	}
+	framing, err := snapshot.ParsePackCompressionMode(o.packFraming)
+	if err != nil {
+		return err
+	}
+	codec, err := snapshot.ParseCompressionAlgo(o.compression)
+	if err != nil {
+		return err
+	}
+	provider, err := tenantconfig.LoadProviderModeWatched(ctx, mode, o.tenantConfig, o.tenantSecretsFile, o.credentialCacheTTL)
+	if err != nil {
+		return fmt.Errorf("load tenant provider: %w", err)
+	}
+	b.provider = provider
+	b.router = gateway.NewTenantRouter(nil, nil, b.dedup, b.refs, b.staging, o.packSize,
+		gateway.WithBindingProvider(provider, manifestDSNs),
+		gateway.WithCompressionPolicy(snapshot.NewContentTypePolicy(codec)),
+		gateway.WithPackCompression(framing),
+		gateway.WithBackingMeter(b.metrics.Meter()))
+	return nil
+}
+
 // startControlPlane brings up the NATS control-plane face (ADR §2.5/§2.9): it
 // connects to NATS, loads the per-tenant credential provider from the
 // tenant-config file, starts a controlplane.Server over the shared dedup index,
-// and constructs a per-tenant gateway.TenantRouter bound through the same
-// provider (the per-tenant direct-I/O path of ADR §2.6). It returns a stop
+// and shares the provider initialized by build. It returns a stop
 // function that drains the server subscriptions and the NATS connection; the
 // caller defers it for graceful shutdown.
 //
-// The HTTP data path (b.gw) is untouched — the control plane is an additive,
-// opt-in second face sharing the same index + ref + staging stores (ADR §3).
+// The HTTP data path and control plane share the initialized tenant router.
 func startControlPlane(ctx context.Context, o options, b *built) (func(), error) {
 	if o.tenantConfig == "" {
 		return nil, fmt.Errorf("control-plane requires -tenant-config")
 	}
 
-	mode, err := tenantconfig.ParseCredentialMode(o.credentialMode)
-	if err != nil {
-		return nil, err
-	}
-	// Watched variant: the provider polls the tenant-config file and atomically
-	// swaps its tenant→Descriptor map on change, so tenant add/remove takes effect
-	// WITHOUT restarting blobgw (the Helm checksum/tenants pod-roll is no longer
-	// needed for the bind/presign data path). The initial load still fails fast on
-	// a bad config; the polling goroutine is bound to ctx and exits on shutdown.
-	provider, err := tenantconfig.LoadProviderModeWatched(ctx, mode, o.tenantConfig, o.tenantSecretsFile, o.credentialCacheTTL)
-	if err != nil {
-		return nil, fmt.Errorf("load tenant provider: %w", err)
+	provider := b.provider
+	if provider == nil || b.router == nil {
+		return nil, fmt.Errorf("control-plane requires initialized tenant routing")
 	}
 
 	// Parse the tenant-config file directly too (the provider hides it) so the
@@ -788,36 +794,6 @@ func startControlPlane(ctx context.Context, o options, b *built) (func(), error)
 		return nil, fmt.Errorf("start control-plane server: %w", err)
 	}
 
-	// Build the per-tenant TenantRouter ONCE, here in control-plane setup where the
-	// provider + manifest-DSN routing exist, and stash it on b.router so BOTH the
-	// admin backfill/GC endpoints (server.New, on every control-plane daemon) AND
-	// the leader-elected GC sweeper (below, gc-leader only) resolve each tenant's
-	// OWN backend through the same router (ADR §2.6). It shares the daemon's
-	// dedup/ref/staging stores, so it purges/records the same index the data path
-	// writes through. Each tenant's S3 chunk store is wrapped for the backing-store
-	// RED view (the daemon's shared meter; a no-op meter when metrics are off).
-	//
-	// Manifest DSN routing (converged mlfs -remote): tenants listed here have their
-	// slice manifests in their own meta DB, not S3, so per-tenant GC reads the live
-	// set from PostgreSQL. Absent tenants keep the S3 manifest store. Empty file =
-	// all-S3 (the object-gateway posture).
-	manifestDSNs, err := loadManifestDSNs(o.manifestDSNFile)
-	if err != nil {
-		if cerr := cp.Close(); cerr != nil {
-			slog.Warn("blobgw: control-plane close", "err", cerr)
-		}
-		nc.Close()
-		return nil, fmt.Errorf("load manifest DSNs: %w", err)
-	}
-	routerFraming, err := snapshot.ParsePackCompressionMode(o.packFraming)
-	if err != nil {
-		return nil, fmt.Errorf("parse -pack-framing: %w", err)
-	}
-	b.router = gateway.NewTenantRouter(nil, nil, b.dedup, b.refs, b.staging, o.packSize,
-		gateway.WithBindingProvider(provider, manifestDSNs),
-		gateway.WithPackCompression(routerFraming),
-		gateway.WithBackingMeter(b.metrics.Meter()))
-
 	// Optionally start the leader-elected per-tenant GC sweeper (ADR §2.4 #29,
 	// §4 I3). It runs over the SAME per-tenant TenantRouter (b.router) built above,
 	// sharing the daemon's dedup/ref/staging stores, so the GC purges the same
@@ -837,20 +813,13 @@ func startControlPlane(ctx context.Context, o options, b *built) (func(), error)
 
 	slog.Info("blobgw: control-plane up", "nats_url", o.natsURL,
 		"nats_account_creds", o.natsCreds != "" || o.natsNKey != "",
-		"tenant_config", o.tenantConfig, "credential_mode", string(mode),
+		"tenant_config", o.tenantConfig, "credential_mode", o.credentialMode,
 		"credential_cache_ttl", o.credentialCacheTTL,
 		"presign_max_ttl", o.presignMaxTTL, "gc_leader", o.gcLeader)
 
 	stop := func() {
 		if stopGC != nil {
 			stopGC()
-		}
-		// Release the per-tenant router's PG manifest DB pools (no-op for the S3-only
-		// posture). The router is owned here now (built in control-plane setup and
-		// shared by the admin endpoints + the GC sweeper), so it is closed here — the
-		// GC runner no longer owns it.
-		if cerr := b.router.Close(); cerr != nil {
-			slog.Warn("blobgw: tenant router close", "err", cerr)
 		}
 		if err := cp.Close(); err != nil {
 			slog.Warn("blobgw: control-plane close", "err", err)
@@ -873,14 +842,14 @@ func startControlPlane(ctx context.Context, o options, b *built) (func(), error)
 // leader — sweeps each configured tenant's pack store with the conservative
 // safety window (HC1, default 24h). It returns a stop function that cancels the
 // runner (releasing the lease) and waits for it; the router itself is owned (and
-// closed) by control-plane setup, not here.
+// closed) by build, not here.
 //
 // HC2 (node-side write-back-backlog fail-safe) is the mlfs-node-side dependency
 // that makes the finite window sufficient (ADR §4); it is OUT of scope here.
 func startGCRunner(ctx context.Context, o options, b *built,
 	tenantFile *tenantconfig.File, nc *nats.Conn) (func(), error) {
 
-	// Reuse the per-tenant router built once in control-plane setup (shared by the
+	// Reuse the per-tenant router built once during initialization (shared by the
 	// admin backfill/GC endpoints), so GC purges the same dedup index writes go
 	// through and there is a single per-tenant backend cache.
 	router := b.router
