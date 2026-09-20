@@ -86,6 +86,7 @@ type options struct {
 	natsURL            string
 	natsCreds          string
 	natsNKey           string
+	httpTenantRouting  bool
 	tenantConfig       string
 	tenantSecretsFile  string
 	credentialMode     string
@@ -169,9 +170,10 @@ func main() {
 	// account. See docs/blobgw-control-plane-accounts.md.
 	flag.StringVar(&o.natsCreds, "nats-creds", "", "path to a NATS credentials file selecting the blobgw control-plane (service) account (control-plane=true; ADR §7.7). Empty = legacy single-account.")
 	flag.StringVar(&o.natsNKey, "nats-nkey", "", "path to a NATS nkey seed file selecting the blobgw control-plane (service) account (control-plane=true; alternative to -nats-creds). Empty = legacy single-account.")
-	flag.StringVar(&o.tenantConfig, "tenant-config", "", "path to the per-tenant resolver records (control-plane=true): EITHER a single JSON file OR a DIRECTORY of per-tenant *.json files (each hot-reloaded, one file per tenant for onboarding); see tenantconfig schema (ADR §2.9). Each record may carry an optional manifestDSN (per-tenant PG manifest routing), superseding -manifest-dsn-file")
+	flag.BoolVar(&o.httpTenantRouting, "http-tenant-routing", false, "route internal HTTP data requests by X-Blobgw-Domain using -tenant-config; independent of NATS")
+	flag.StringVar(&o.tenantConfig, "tenant-config", "", "path to per-tenant resolver records for HTTP and optional control plane: EITHER a single JSON file OR a DIRECTORY of per-tenant *.json files (each hot-reloaded, one file per tenant for onboarding); see tenantconfig schema (ADR §2.9). Each record may carry an optional manifestDSN (per-tenant PG manifest routing), superseding -manifest-dsn-file")
 	flag.StringVar(&o.tenantSecretsFile, "tenant-secrets-file", "", "optional JSON file mapping credentialRef → {accessKey,secretKey}; env BLOBGW_TENANT_KEY_*/SECRET_* take precedence (credential-mode=static only)")
-	flag.StringVar(&o.credentialMode, "credential-mode", string(tenantconfig.CredentialModeStatic), "per-tenant credential source (control-plane=true): static (credentialRef = secret ref; dev + non-AWS prod) | aws-sts (credentialRef = IAM role ARN, STS-assumed via IRSA web-identity token; requires AWS_WEB_IDENTITY_TOKEN_FILE in the pod) (ADR §2.9)")
+	flag.StringVar(&o.credentialMode, "credential-mode", string(tenantconfig.CredentialModeStatic), "per-tenant credential source: static (credentialRef = secret ref; dev + non-AWS prod) | aws-sts (credentialRef = IAM role ARN, STS-assumed via IRSA web-identity token; requires AWS_WEB_IDENTITY_TOKEN_FILE in the pod) (ADR §2.9)")
 	flag.DurationVar(&o.credentialCacheTTL, "credential-cache-ttl", tenantconfig.DefaultCacheTTL, "per-tenant credential cache TTL; doubles as the secret-rotation pickup (ADR §2.9). In aws-sts mode the cache also refreshes before STS session expiry")
 	flag.DurationVar(&o.presignMaxTTL, "presign-max-ttl", 15*time.Minute, "cap on minted presigned-URL validity (ADR §2.9); effective TTL = min(requested, cap)")
 
@@ -193,6 +195,11 @@ func main() {
 	flag.DurationVar(&o.metricsPushInterval, "metrics-push-interval", 10*time.Second, "OTLP push cadence (-otel-endpoint)")
 	flag.Float64Var(&o.otelTraceSampling, "otel-trace-sampling", 1.0, "head-sampling ratio for distributed traces (parent-based): 1.0 = every root trace, 0.0 = none. Only effective with -otel-endpoint (traces need a collector); a sampled upstream caller's trace is always continued regardless")
 	flag.Parse()
+
+	if o.httpTenantRouting && o.tenantConfig == "" {
+		slog.Error("blobgw: -http-tenant-routing requires -tenant-config")
+		os.Exit(1)
+	}
 
 	if o.gcLeader && !o.controlPlane {
 		slog.Error("blobgw: -gc-leader requires -control-plane (needs the per-tenant router + NATS)")
@@ -221,6 +228,18 @@ func main() {
 		defer stopCP()
 	}
 
+	// HTTP-only installations also need per-tenant bindings. Previously the
+	// tenant config was silently ignored unless the optional NATS face was on.
+	if o.httpTenantRouting && !o.controlPlane {
+		router, err := buildHTTPTenantRouter(ctx, o, b)
+		if err != nil {
+			slog.Error("blobgw: HTTP tenant routing init", "err", err)
+			os.Exit(1)
+		}
+		b.router = router
+		defer router.Close()
+	}
+
 	if o.gcInterval > 0 {
 		go b.gc.Loop(ctx, o.gcInterval)
 	}
@@ -246,6 +265,9 @@ func main() {
 		srvOpts = append(srvOpts, server.WithBackfill(pgBackfill{
 			router: b.router, chunks: b.chunks, rec: b.dedup, logger: slog.Default(),
 		}))
+	}
+	if o.httpTenantRouting {
+		srvOpts = append(srvOpts, server.WithTenantRouter(b.router))
 	}
 	if b.router != nil {
 		// Use the leader-elected safety window when configured; else the GC default

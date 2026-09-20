@@ -47,3 +47,19 @@ changing the compression policy of a model-serving filesystem.
 
 See [observability](OBSERVABILITY.md) for instrument names and
 [data model](data-model.md) for persistent schemas and formats.
+
+## Internal HTTP tenant routing
+
+When an installation uses blobgw-edge with tenant bindings, start the internal
+blob gateway with `-http-tenant-routing -tenant-config /path/to/tenants.json`
+and the same credential mode, ref database and staging settings as the edge.
+Every internal `/v1` data request must carry exactly one `X-Blobgw-Domain`
+header naming a configured tenant. Missing, unknown or unavailable tenant
+bindings fail closed. Operational health endpoints do not require that header.
+
+This mode does not require NATS. It resolves through the same tenant router as
+the edge, including its bucket/prefix layout and credential refresh. Setting
+`-tenant-config` alone does not enable this mode; the explicit flag preserves
+existing single-domain HTTP installations. The gateway remains an internal
+trusted API: NetworkPolicy must limit its callers, and browser access must use
+the authenticated edge and the application's document/workspace authorization.
