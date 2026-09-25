@@ -59,7 +59,7 @@ type CacheOpts struct {
 	// Per-NODE mlfs tuning, forwarded to the daemon. Set these high on read-heavy
 	// node pools (e.g. GPU model loading) via the CSI DaemonSet, default elsewhere.
 	// MaxBackground (-max-background): concurrent FUSE readahead/in-flight requests
-	// (mlfs default 12); 64-256 lets a model loader keep many shard reads in flight.
+	// (mlfs default 64); 128-256 lets a model loader keep more shard reads in flight.
 	// MaxRWSize (-max-rw-size): FUSE max read/write size (mlfs default = the 1 MiB
 	// kernel cap). DBMaxOpenConns (-db-max-open-conns): metadata PG pool bound
 	// (mlfs default 8 — the throughput sweet spot); lower it (e.g. 4) on nodes
