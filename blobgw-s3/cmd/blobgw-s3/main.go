@@ -5,18 +5,22 @@
 // object gateway. Off-the-shelf S3 clients (aws-cli, aws-sdk-go-v2) get
 // casstore's content-addressed dedup and transparent compression for free.
 //
-// The single binary serves local dev and single-node production: a
-// local-filesystem casstore stack (manifests + chunks under -data-dir), an
+// The binary wires a single local-filesystem profile for development and
+// evaluation: a casstore stack (manifests + chunks under -data-dir), an
 // in-memory dedup/ref index, and a credential store loaded from a JSON file
 // (-credentials) that maps each access key to its secret and dedup domain.
 // Buckets are explicit: a client must CreateBucket before any object op, and a
 // bucket is pinned at creation to the creating credential's dedup domain. This
 // keeps the bucket→domain mapping stable and gives a clean NoSuchBucket for
-// object ops against a never-created bucket.
+// object ops against a never-created bucket. Object keys are not prefixed by
+// bucket, so buckets pinned to the same domain share one key namespace.
 //
-// Production swaps the local backends for S3 chunk storage plus Postgres-backed
-// dedup/ref/credential/bucket stores; the wiring here is the local-fs profile
-// that the integration smoke and dev workflows exercise. See README.md.
+// Because the ref index is in memory, objects are unreachable through the S3
+// API after a restart (their manifests and packs remain under -data-dir), even
+// with -registry-backend=jetstream, which persists only the bucket, credential,
+// and multipart-upload registries. A persistent deployment needs S3 chunk
+// storage plus Postgres-backed dedup/ref stores, which this command does not
+// wire. See README.md.
 package main
 
 import (
@@ -48,7 +52,7 @@ func main() {
 	gcInterval := flag.Duration("gc-interval", 10*time.Minute, "chunked-GC interval (0 disables)")
 	gcSafetyWindow := flag.Duration("gc-safety-window", time.Hour, "do not GC blobs younger than this (guards the GC↔in-flight-write race)")
 	credentialsPath := flag.String("credentials", os.Getenv("BLOBGW_S3_CREDENTIALS"), "path to the JSON credentials file (access key → {secret, domain}); defaults to $BLOBGW_S3_CREDENTIALS")
-	registryBackend := flag.String("registry-backend", "memory", "bucket/credential/MPU registry backend: memory (default, in-process) | jetstream (NATS JetStream KV, survives restart — ADR-001 #37)")
+	registryBackend := flag.String("registry-backend", "memory", "bucket/credential/MPU registry backend: memory (default, in-process) | jetstream (NATS JetStream KV, survives restart — ADR-001 #37). Object refs and the dedup index stay in memory either way, so objects are not reachable after a restart")
 	natsURL := flag.String("nats-url", nats.DefaultURL, "NATS server URL (used when -registry-backend=jetstream)")
 	bucketKVBucket := flag.String("bucket-kv", s3.DefaultBucketKVBucket, "JetStream KV bucket name for the bucket registry (jetstream backend)")
 	credentialKVBucket := flag.String("credential-kv", s3.DefaultCredentialKVBucket, "JetStream KV bucket name for the credential registry (jetstream backend)")
@@ -90,9 +94,10 @@ func main() {
 	//   - memory (default): in-process registries; state is lost on restart. This
 	//     preserves the original single-binary dev/single-node behavior exactly.
 	//   - jetstream: bucket/credential/MPU registries are backed by NATS
-	//     JetStream KV so they survive a restart (ADR-001 #37). blobgw-s3 is OUT
-	//     of the mlfs hot path (nodes go direct to S3), so this only matters for
-	//     blobgw-s3's external-endpoint / backup role.
+	//     JetStream KV so they survive a restart (ADR-001 #37). The object-ref
+	//     and dedup indexes are still in memory, so stored objects do not.
+	//     blobgw-s3 is OUT of the mlfs hot path (nodes go direct to S3), so this
+	//     only matters for blobgw-s3's external-endpoint / backup role.
 	cfg := s3.Config{Router: router, MaxObject: *maxObjectSize}
 	switch *registryBackend {
 	case "memory":
