@@ -103,8 +103,13 @@ and `mlfs-admin fsck -reap-locks` clears them offline (single-node).
 ### `xattr` — extended attributes
 
 `inode` BIGINT, `name` BYTEA, `value` BYTEA; PK `(inode, name)`. Also stores
-POSIX ACL blobs (`system.posix_acl_*`) as **passthrough** — they are persisted
-but not enforced in permission checks (enforcement is L2.8).
+POSIX ACL blobs (`system.posix_acl_access` / `system.posix_acl_default`) in the
+kernel's xattr binary format. On a FUSE mount they **are enforced**: the mount
+sets `default_permissions` and advertises `CAP_POSIX_ACL`, so the kernel reads
+the ACL xattrs through this table and applies them in its permission checks.
+mlfs itself only computes default-ACL inheritance when a file or directory is
+created. Non-FUSE callers of the metadata engine get a coarse owner/group/other
+mode check only; ACLs are not evaluated on that path.
 
 ### `ownership` — per-scope write-affinity lease
 

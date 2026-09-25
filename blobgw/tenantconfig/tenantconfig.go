@@ -3,11 +3,11 @@
 
 // Package tenantconfig loads blobgw's per-tenant resolver records + secret
 // references from a JSON file and assembles a tenantbind.Provider from them. It
-// is the dev/static-keys wiring of the ADR-001 §2.9 "resolver record":
-// provisioning publishes, per tenant, a record of {endpoint, region, bucket,
-// prefix, credentialRef}; blobgw reads that record at runtime to build the
-// tenant→Descriptor Resolver, and resolves each credentialRef to a static
-// access/secret key pair through a SecretStore.
+// is the wiring of the ADR-001 §2.9 "resolver record": provisioning publishes,
+// per tenant, a record of {endpoint, region, bucket, prefix, credentialRef};
+// blobgw reads that record at runtime to build the tenant→Descriptor Resolver,
+// and resolves each credentialRef to credentials according to the
+// CredentialMode (see provider.go).
 //
 // # JSON schema
 //
@@ -26,11 +26,19 @@
 //	}
 //
 // Each tenant entry maps to a tenantbind.Descriptor. The credentialRef is the
-// opaque, impl-interpreted reference of ADR §2.9 — here it names a static key
-// pair that the FileEnvSecretStore resolves from either an environment variable
-// or a JSON secrets file.
+// opaque, impl-interpreted reference of ADR §2.9; its meaning depends on the
+// CredentialMode:
 //
-// # Secret resolution (FileEnvSecretStore)
+//   - CredentialModeStatic ("static", the default): credentialRef names a
+//     static key pair that the FileEnvSecretStore resolves from either an
+//     environment variable or a JSON secrets file (below).
+//   - CredentialModeAWSSTS ("aws-sts", ADR §2.9 "Option 2"): credentialRef is
+//     an IAM role ARN that is assumed with AssumeRoleWithWebIdentity using the
+//     pod's IRSA web-identity token (AWS_WEB_IDENTITY_TOKEN_FILE must be set).
+//     The resulting STS session credentials are cached and refreshed before
+//     they expire. No secrets file is consulted in this mode.
+//
+// # Secret resolution (FileEnvSecretStore, static mode)
 //
 // credentialRef is resolved to an access/secret key pair, in order:
 //
@@ -45,9 +53,6 @@
 // per process. A ref present in neither source resolves to
 // tenantbind.ErrSecretNotFound, so the caller (StaticKeysProvider) surfaces a
 // clear per-tenant failure rather than minting an empty credential.
-//
-// The AWS AssumeRoleWithWebIdentity provider (ADR §2.9 "Option 2") is a deferred
-// milestone; this package implements only the portable static-keys source.
 package tenantconfig
 
 import (
