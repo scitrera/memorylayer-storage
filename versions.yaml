@@ -138,5 +138,5 @@ docker:
         VERSION: ${image_version}
 preferred_versions:
   go:
-    google.golang.org/grpc: v1.82.1
-    golang.org/x/text: v0.39.0
+    google.golang.org/grpc: v1.83.2
+    golang.org/x/text: v0.41.0
